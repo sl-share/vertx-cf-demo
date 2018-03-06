@@ -1,0 +1,8 @@
+applications:
+        - path: ./target/hello-service-1.0-SNAPSHOT.jar
+          memory: 786M
+          instances: 1
+          name: hello-service
+          buildpack: https://github.com/cloudfoundry/java-buildpack.git
+          services:
+                  - my-redis

@@ -4,6 +4,7 @@ import io.reactivex.Single;
 import io.vertx.core.Future;
 import io.vertx.core.http.HttpHeaders;
 import io.vertx.core.json.JsonObject;
+import io.vertx.reactivex.RxHelper;
 import io.vertx.reactivex.core.AbstractVerticle;
 import io.vertx.reactivex.ext.web.Router;
 import io.vertx.reactivex.ext.web.RoutingContext;
@@ -13,6 +14,7 @@ import io.vertx.servicediscovery.Record;
 import io.vertx.servicediscovery.ServiceDiscoveryOptions;
 import lombok.val;
 import org.springframework.cloud.CloudFactory;
+import org.springframework.cloud.app.ApplicationInstanceInfo;
 import org.springframework.cloud.service.common.RedisServiceInfo;
 
 import java.util.List;
@@ -28,15 +30,21 @@ public class HelloService extends AbstractVerticle {
 
     private CloudFactory cloudFactory;
 
+    private ApplicationInstanceInfo applicationInstanceInfo;
+
+    private Single<Record> serverRegistration;
+
     @Override
     public void start(Future<Void> startFuture) {
         cloudFactory = new CloudFactory();
+
+        applicationInstanceInfo = cloudFactory.getCloud().getApplicationInstanceInfo();
 
         val server = vertx.createHttpServer()
                 .requestHandler(router()::accept)
                 .rxListen(8080);
 
-        Single.zip(
+        serverRegistration = Single.zip(
                 serviceDiscovery(),
                 server,
                 (serviceDiscovery, httpServer) -> {
@@ -48,19 +56,35 @@ public class HelloService extends AbstractVerticle {
                             .orElse(Single.error(new Exception("Invalid external service url!")));
                 })
                 .flatMap(x -> x)
-                .subscribe(
-                        r -> {
-                            System.out.println("Service successfully registered.");
-                            startFuture.complete();
-                        },
-                        startFuture::fail
-                );
+                .cache();
+
+        serverRegistration
+                .subscribeOn(RxHelper.blockingScheduler(vertx.getDelegate()))
+                .subscribe(r -> {
+                    System.out.println(
+                            String.format("Service [%s] successfully registered.",
+                                    applicationInstanceInfo.getInstanceId())
+                    );
+                    startFuture.complete();
+                },
+                startFuture::fail
+        );
+    }
+
+    @Override
+    public void stop(Future<Void> stopFuture) {
+        Single.zip(serviceDiscovery(), serverRegistration,
+                (discovery, registration) -> discovery.rxUnpublish(registration.getRegistration()))
+                .flatMapCompletable(x -> x)
+                .subscribeOn(RxHelper.blockingScheduler(vertx.getDelegate()))
+                .subscribe(stopFuture::complete, stopFuture::fail);
     }
 
     private void helloHandler(RoutingContext rc) {
         String message = "Hello";
         if (rc.pathParam("name") != null) {
-            message += " " + rc.pathParam("name") + " from the vert.x server!";
+            message += String.format(" %s from the vert.x server [%s]!", rc.pathParam("name"),
+                    applicationInstanceInfo.getInstanceId());
         }
         val json = new JsonObject().put("message", message);
         rc.response()
@@ -96,8 +120,7 @@ public class HelloService extends AbstractVerticle {
     @SuppressWarnings("unchecked")
     private Optional<String> serviceUri() {
         return Optional.ofNullable(
-                cloudFactory.getCloud()
-                        .getApplicationInstanceInfo()
+                applicationInstanceInfo
                         .getProperties()
                         .get("application_uris"))
                 .filter(u -> u instanceof List && !((List) u).isEmpty())
